@@ -180,6 +180,7 @@ func (p *HTTPProxy) transportRequestHTTPS(w http.ResponseWriter, r *http.Request
 			request.URL.Host = r.Host
 			request.RequestURI = request.URL.String()
 			request.RemoteAddr = r.RemoteAddr
+			p.removeProxyHeaders(request)
 			//******************
 			response, err := p.transport.RoundTrip(request)
 			//******************
