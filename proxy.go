@@ -37,6 +37,26 @@ type HTTPProxy struct {
 	decryptHTTPS bool
 }
 
+func NewHTTPProxy(certfile, keyfile string, decryptHTTPS bool) (*HTTPProxy, error) {
+	p := HTTPProxy{
+		Hooks:        &Hooks{},
+		transport:    &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, Proxy: http.ProxyFromEnvironment},
+		decryptHTTPS: decryptHTTPS,
+	}
+	if decryptHTTPS {
+		ca, err := tls.LoadX509KeyPair(certfile, keyfile)
+		if err != nil {
+			return nil, err
+		}
+		x509certificate, err := x509.ParseCertificate(ca.Certificate[0])
+		if err != nil {
+			return nil, err
+		}
+		p.ca = &certificateAuthority{certificate: x509certificate, privateKey: ca.PrivateKey}
+	}
+	return &p, nil
+}
+
 func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.Hooks.Request != nil {
 		p.Hooks.Request(r)
@@ -45,7 +65,7 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if p.decryptHTTPS {
 			p.transportRequestHTTPS(w, r)
 		} else {
-			p.relayHTTPSRequest(w, r)
+			p.relayRequestHTTPS(w, r)
 		}
 		return
 	}
@@ -87,91 +107,94 @@ func (p *HTTPProxy) transportRequestHTTPS(w http.ResponseWriter, r *http.Request
 		return errors.New("httpserver does not suppert hijacking")
 	}
 	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		return err
+	}
 	clientConn.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
-	if err != nil {
-		return err
-	}
-	tlsConfig := tls.Config{InsecureSkipVerify: true}
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		return err
-	}
-	certificate := certificates[host]
-	if certificate == nil {
-		now := time.Now()
-		start := now.Add(-time.Minute)
-		end := now.Add(30 * 3600 * time.Hour)
-		h := sha1.New()
-		h.Write([]byte(host))
-		randomBytes := make([]byte, 256)
-		mrand.Read(randomBytes)
-		h.Write(randomBytes)
-		binary.Write(h, binary.BigEndian, start)
-		binary.Write(h, binary.BigEndian, end)
-		hash := h.Sum(nil)
-		serialNumber := big.Int{}
-		serialNumber.SetBytes(hash)
-		serverCertificateTemplate := x509.Certificate{
-			SignatureAlgorithm:    p.ca.certificate.SignatureAlgorithm,
-			SerialNumber:          &serialNumber,
-			Issuer:                p.ca.certificate.Subject,
-			Subject:               pkix.Name{Organization: []string{"DAST"}, CommonName: host},
-			NotBefore:             start,
-			NotAfter:              end,
-			KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDataEncipherment | x509.KeyUsageDigitalSignature,
-			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-			BasicConstraintsValid: true,
-			IsCA:                  false,
-			MaxPathLen:            0,
-			MaxPathLenZero:        true,
-			DNSNames:              []string{host},
-		}
-		derBytes, err := x509.CreateCertificate(rand.Reader, &serverCertificateTemplate, p.ca.certificate, p.ca.certificate.PublicKey, p.ca.privateKey)
+	go func() {
+		tlsConfig := tls.Config{InsecureSkipVerify: true}
+		host, _, err := net.SplitHostPort(r.Host)
 		if err != nil {
-			return err
+			return
 		}
-		certificate = &tls.Certificate{
-			Certificate: [][]byte{derBytes, p.ca.certificate.Raw},
-			PrivateKey:  p.ca.privateKey,
+		certificate := certificates[host]
+		if certificate == nil {
+			now := time.Now()
+			start := now.Add(-time.Minute)
+			end := now.Add(30 * 3600 * time.Hour)
+			h := sha1.New()
+			h.Write([]byte(host))
+			randomBytes := make([]byte, 256)
+			mrand.Read(randomBytes)
+			h.Write(randomBytes)
+			binary.Write(h, binary.BigEndian, start)
+			binary.Write(h, binary.BigEndian, end)
+			hash := h.Sum(nil)
+			serialNumber := big.Int{}
+			serialNumber.SetBytes(hash)
+			serverCertificateTemplate := x509.Certificate{
+				SignatureAlgorithm:    p.ca.certificate.SignatureAlgorithm,
+				SerialNumber:          &serialNumber,
+				Issuer:                p.ca.certificate.Subject,
+				Subject:               pkix.Name{Organization: []string{"DAST"}, CommonName: host},
+				NotBefore:             start,
+				NotAfter:              end,
+				KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDataEncipherment | x509.KeyUsageDigitalSignature,
+				ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+				BasicConstraintsValid: true,
+				IsCA:                  false,
+				MaxPathLen:            0,
+				MaxPathLenZero:        true,
+				DNSNames:              []string{host},
+			}
+			derBytes, err := x509.CreateCertificate(rand.Reader, &serverCertificateTemplate, p.ca.certificate, p.ca.certificate.PublicKey, p.ca.privateKey)
+			if err != nil {
+				return
+			}
+			certificate = &tls.Certificate{
+				Certificate: [][]byte{derBytes, p.ca.certificate.Raw},
+				PrivateKey:  p.ca.privateKey,
+			}
+			certificates[host] = certificate
 		}
-		certificates[host] = certificate
-	}
-	tlsConfig.Certificates = append(tlsConfig.Certificates, *certificate)
-	tlsConn := tls.Server(clientConn, &tlsConfig)
-	err = tlsConn.Handshake()
-	if err != nil {
-		return err
-	}
-	defer tlsConn.Close()
-	tlsIn := bufio.NewReader(tlsConn)
-	for {
-		_, err := tlsIn.Peek(1)
-		if err == io.EOF {
-			break
-		}
-		request, err := http.ReadRequest(tlsIn)
+		tlsConfig.Certificates = append(tlsConfig.Certificates, *certificate)
+		tlsConn := tls.Server(clientConn, &tlsConfig)
+		err = tlsConn.Handshake()
 		if err != nil {
+			return
+		}
+		defer tlsConn.Close()
+		tlsIn := bufio.NewReader(tlsConn)
+		for {
+			_, err := tlsIn.Peek(1)
 			if err == io.EOF {
 				break
 			}
+			request, err := http.ReadRequest(tlsIn)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+			}
+			request.URL.Scheme = "https"
+			request.URL.Host = r.Host
+			request.RequestURI = request.URL.String()
+			request.RemoteAddr = r.RemoteAddr
+			response, err := p.transport.RoundTrip(request)
+			if err != nil {
+				return
+			}
+			if p.Hooks.Response != nil {
+				p.Hooks.Response(response)
+			}
+			response.Write(tlsConn)
 		}
-		request.URL.Scheme = "https"
-		request.URL.Host = r.Host
-		request.RequestURI = request.URL.String()
-		request.RemoteAddr = r.RemoteAddr
-		response, err := p.transport.RoundTrip(request)
-		if err != nil {
-			return err
-		}
-		if p.Hooks.Response != nil {
-			p.Hooks.Response(response)
-		}
-		response.Write(tlsConn)
-	}
+		return
+	}()
 	return nil
 }
 
-func (p *HTTPProxy) relayHTTPSRequest(w http.ResponseWriter, r *http.Request) {
+func (p *HTTPProxy) relayRequestHTTPS(w http.ResponseWriter, r *http.Request) {
 	serverConn, err := net.Dial("tcp", r.Host)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -202,24 +225,4 @@ func (p *HTTPProxy) removeProxyHeaders(r *http.Request) {
 	r.Header.Del("Proxy-Authenticate")
 	r.Header.Del("Proxy-Authorization")
 	r.Header.Del("Connection")
-}
-
-func NewHTTPProxy(certfile, keyfile string, decryptHTTPS bool) (*HTTPProxy, error) {
-	p := HTTPProxy{
-		Hooks:        &Hooks{},
-		transport:    &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, Proxy: http.ProxyFromEnvironment},
-		decryptHTTPS: decryptHTTPS,
-	}
-	if decryptHTTPS {
-		ca, err := tls.LoadX509KeyPair(certfile, keyfile)
-		if err != nil {
-			return nil, err
-		}
-		x509certificate, err := x509.ParseCertificate(ca.Certificate[0])
-		if err != nil {
-			return nil, err
-		}
-		p.ca = &certificateAuthority{certificate: x509certificate, privateKey: ca.PrivateKey}
-	}
-	return &p, nil
 }
