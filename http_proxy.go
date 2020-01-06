@@ -37,13 +37,12 @@ type HTTPProxy struct {
 	decryptHTTPS bool
 }
 
-func NewHTTPProxy(certfile, keyfile string, decryptHTTPS bool) (*HTTPProxy, error) {
+func NewHTTPProxy(certfile, keyfile string) (*HTTPProxy, error) {
 	p := HTTPProxy{
-		Hooks:        &Hooks{},
-		transport:    &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, Proxy: http.ProxyFromEnvironment},
-		decryptHTTPS: decryptHTTPS,
+		Hooks:     &Hooks{},
+		transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, Proxy: http.ProxyFromEnvironment},
 	}
-	if decryptHTTPS {
+	if len(certfile) != 0 && len(keyfile) != 0 {
 		ca, err := tls.LoadX509KeyPair(certfile, keyfile)
 		if err != nil {
 			return nil, err
@@ -53,6 +52,7 @@ func NewHTTPProxy(certfile, keyfile string, decryptHTTPS bool) (*HTTPProxy, erro
 			return nil, err
 		}
 		p.ca = &certificateAuthority{certificate: x509certificate, privateKey: ca.PrivateKey}
+		p.decryptHTTPS = true
 	}
 	return &p, nil
 }
