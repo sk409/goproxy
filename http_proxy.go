@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	mrand "math/rand"
@@ -58,6 +59,7 @@ func NewHTTPProxy(certfile, keyfile string) (*HTTPProxy, error) {
 }
 
 func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fmt.Println(p.Hooks.Request)
 	if p.Hooks.Request != nil {
 		p.Hooks.Request(r)
 	}
